@@ -3,7 +3,7 @@ const EMAIL_TWO: &str = concat!("user2", "@", "example.com");
 
 use axum::{routing::get, Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use closedmcp_sdk::{closed_mcp_person, router, Options, Verifier};
+use closedmcp_sdk::{closed_mcp_person, router, Options, Verifier, VerifyError};
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rand::rngs::OsRng;
@@ -113,7 +113,7 @@ async fn verifies_passes_and_required_config() {
         f.pass(json!({"jti":""}), None),
         f.pass(json!({"aud":[f.resource]}), None),
     ];
-    assert!(verify.verify(None).await.is_err());
+    assert!(matches!(verify.verify(None).await, Err(VerifyError)));
     for token in bad {
         assert!(verify
             .verify(Some(&format!("Bearer {token}")))

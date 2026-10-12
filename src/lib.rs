@@ -72,6 +72,20 @@ impl std::fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
+#[derive(Debug)]
+pub struct VerifyError;
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pass verification failed")
+    }
+}
+impl std::error::Error for VerifyError {}
+impl From<()> for VerifyError {
+    fn from(_: ()) -> Self {
+        Self
+    }
+}
+
 #[derive(Deserialize)]
 struct Claims {
     iss: String,
@@ -156,18 +170,18 @@ impl Verifier {
             .map_err(|_| ())
     }
 
-    pub async fn verify(&self, authorization: Option<&str>) -> Result<Person, ()> {
+    pub async fn verify(&self, authorization: Option<&str>) -> Result<Person, VerifyError> {
         let value = authorization.ok_or(())?;
         let (scheme, token) = value.split_once(char::is_whitespace).ok_or(())?;
         if !scheme.eq_ignore_ascii_case("Bearer")
             || token.is_empty()
             || token.chars().any(char::is_whitespace)
         {
-            return Err(());
+            return Err(VerifyError);
         }
         let header = decode_header(token).map_err(|_| ())?;
         if header.alg != Algorithm::EdDSA {
-            return Err(());
+            return Err(VerifyError);
         }
         let kid = header.kid.ok_or(())?;
         let mut keys = self.keys.read().await.clone();
@@ -206,7 +220,7 @@ impl Verifier {
             || claims.jti.is_empty()
             || !self.allowed.contains(&claims.domain.to_ascii_lowercase())
         {
-            return Err(());
+            return Err(VerifyError);
         }
         Ok(Person {
             id: claims.sub,
@@ -262,7 +276,7 @@ where
                 .and_then(|v| v.to_str().ok());
             let person = match verifier.verify(authorization).await {
                 Ok(person) => person,
-                Err(()) => {
+                Err(VerifyError) => {
                     let mut response = (
                         StatusCode::UNAUTHORIZED,
                         Json(serde_json::json!({"error":"unauthorized"})),
