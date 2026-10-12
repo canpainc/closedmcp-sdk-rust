@@ -25,4 +25,6 @@ The runnable [template](template/src/main.rs) accepts `MCP_URL`, `ALLOWED_DOMAIN
 
 The resource must exactly match the public MCP URL and token audience. At least one allowed company domain is required. The issuer defaults to `https://closedmcp.canpai.io` and its JWKS. For local tests, set `options.issuer` and `options.jwks_url` before calling `router`. Keys are cached and refreshed on an unknown key ID.
 
+Direct calls to `Verifier::verify` return `Result<Person, VerifyError>`; the error indicates a missing or invalid pass or a key fetch failure.
+
 See the [ClosedMCP documentation](https://closedmcp.canpai.io/docs).
