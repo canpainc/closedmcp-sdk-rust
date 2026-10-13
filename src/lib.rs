@@ -87,6 +87,8 @@ impl From<()> for VerifyError {
     }
 }
 
+type JwksCache = HashMap<String, (Option<JwkSet>, Option<Instant>)>;
+
 #[derive(Deserialize)]
 struct Claims {
     iss: String,
@@ -114,7 +116,7 @@ pub struct Verifier {
     issuer: String,
     allowed: HashSet<String>,
     jwks_url: Option<String>,
-    keys: Arc<Mutex<HashMap<String, (Option<JwkSet>, Option<Instant>)>>>,
+    keys: Arc<Mutex<JwksCache>>,
     http: reqwest::Client,
 }
 
