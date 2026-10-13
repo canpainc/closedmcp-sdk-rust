@@ -1,7 +1,9 @@
 [package]
 name = "closedmcp-sdk"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+rust-version = "1.88"
+autoexamples = false
 license = "Apache-2.0"
 repository = "https://github.com/canpainc/closedmcp-sdk-rust"
 homepage = "https://github.com/canpainc/closedmcp-sdk-rust"
@@ -11,6 +13,7 @@ description = "ClosedMCP authorization for rmcp Streamable HTTP servers"
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 jsonwebtoken = "9.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3.5", features = ["server", "transport-streamable-http-server"] }
@@ -27,4 +30,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "proces
 
 [[bin]]
 name = "hello-template"
-path = "template/src/main.rs"
+path = "examples/hello-template.rs"

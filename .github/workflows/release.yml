@@ -16,6 +16,11 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check tag matches package version
+        if: github.event_name == 'push'
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "closedmcp-sdk") | .version')
+          test "${GITHUB_REF_NAME}" = "v${version}" || { echo "Tag ${GITHUB_REF_NAME} does not match v${version}" >&2; exit 1; }
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - run: rustup default stable
       - run: cargo test

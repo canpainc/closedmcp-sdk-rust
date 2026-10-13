@@ -11,6 +11,10 @@ use rmcp::{service::RequestContext, tool, tool_router, RoleServer};
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -22,7 +26,7 @@ impl Hello {
     #[tool(description = "Greet caller")]
     async fn hello(&self, ctx: RequestContext<RoleServer>) -> String {
         tokio::time::sleep(Duration::from_millis(80)).await;
-        format!("Hello {}", closed_mcp_person(&ctx).email)
+        format!("Hello {}", closed_mcp_person(&ctx).unwrap().email)
     }
 }
 
@@ -46,14 +50,24 @@ struct Fixture {
     issuer: String,
     jwks_url: String,
     jwks_task: JoinHandle<()>,
+    fetches: Arc<AtomicUsize>,
 }
 impl Fixture {
     async fn new() -> Self {
         let key = SigningKey::generate(&mut OsRng);
         let jwk = json!({"kty":"OKP", "crv":"Ed25519", "x": URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()), "kid":"test-key", "alg":"EdDSA", "use":"sig"});
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let count = fetches.clone();
         let (addr, jwks_task) = serve(Router::new().route(
             "/.well-known/jwks.json",
-            get(move || async move { Json(json!({"keys":[jwk]})) }),
+            get(move || {
+                let jwk = jwk.clone();
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"keys":[jwk]}))
+                }
+            }),
         ))
         .await;
         Self {
@@ -62,6 +76,7 @@ impl Fixture {
             issuer: "https://issuer.example".into(),
             jwks_url: format!("http://{addr}/.well-known/jwks.json"),
             jwks_task,
+            fetches,
         }
     }
     fn options(&self) -> Options {
@@ -71,15 +86,49 @@ impl Fixture {
         options
     }
     fn pass(&self, changes: Value, key: Option<&SigningKey>) -> String {
+        self.pass_with_kid(changes, key, "test-key")
+    }
+    fn pass_with_kid(&self, changes: Value, key: Option<&SigningKey>, kid: &str) -> String {
         let mut claims = json!({"iss":self.issuer,"aud":self.resource,"sub":"person-123","email":EMAIL_ONE,"domain":"example.com","org":"acme","client":"Test app","iat":now(),"exp":now()+300,"jti":"pass-123"});
         for (name, value) in changes.as_object().unwrap() {
             claims[name] = value.clone();
         }
         let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some("test-key".into());
+        header.kid = Some(kid.into());
         let der = key.unwrap_or(&self.key).to_pkcs8_der().unwrap();
         encode(&header, &claims, &EncodingKey::from_ed_der(der.as_bytes())).unwrap()
     }
+}
+
+#[tokio::test]
+async fn default_issuers_and_unknown_kid_cooldown() {
+    let f = Fixture::new().await;
+    let mut options = Options::new(&f.resource, vec!["example.com".into()]);
+    assert_eq!(options.issuer, "https://closedmcp.com");
+    options.jwks_url = Some(f.jwks_url.clone());
+    let verifier = Verifier::new(&options).unwrap();
+    for issuer in ["https://closedmcp.com", "https://closedmcp.canpai.io"] {
+        let token = f.pass(json!({"iss":issuer}), None);
+        assert!(verifier
+            .verify(Some(&format!("Bearer {token}")))
+            .await
+            .is_ok());
+    }
+    assert_eq!(f.fetches.load(Ordering::SeqCst), 2);
+    let other = f.pass(json!({"iss":"https://other.example"}), None);
+    assert!(verifier
+        .verify(Some(&format!("Bearer {other}")))
+        .await
+        .is_err());
+    assert_eq!(f.fetches.load(Ordering::SeqCst), 2);
+    let unknown = f.pass_with_kid(json!({"iss":"https://closedmcp.com"}), None, "unknown");
+    for _ in 0..2 {
+        assert!(verifier
+            .verify(Some(&format!("Bearer {unknown}")))
+            .await
+            .is_err());
+    }
+    assert_eq!(f.fetches.load(Ordering::SeqCst), 3);
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

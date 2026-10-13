@@ -8,7 +8,10 @@ struct Hello;
 impl Hello {
     #[tool(description = "Say hello to the signed-in person")]
     fn hello(&self, ctx: RequestContext<RoleServer>) -> String {
-        format!("Hello {}", closed_mcp_person(&ctx).email)
+        closed_mcp_person(&ctx).map_or_else(
+            || "Unauthorized".into(),
+            |person| format!("Hello {}", person.email),
+        )
     }
 }
 
