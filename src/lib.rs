@@ -8,6 +8,7 @@ use axum::{
     routing::any,
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use rmcp::{
     service::RequestContext,
@@ -18,14 +19,15 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use url::Url;
 
-pub const CLOSEDMCP: &str = "https://closedmcp.canpai.io";
+pub const CLOSEDMCP: &str = "https://closedmcp.com";
+const LEGACY_ISSUER: &str = "https://closedmcp.canpai.io";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Person {
@@ -36,12 +38,11 @@ pub struct Person {
     pub ai_app: Option<String>,
 }
 
-/// Read the verified caller from an rmcp tool request.
-pub fn closed_mcp_person(ctx: &RequestContext<RoleServer>) -> &Person {
+/// Read the verified caller from an rmcp tool request, if present.
+pub fn closed_mcp_person(ctx: &RequestContext<RoleServer>) -> Option<&Person> {
     ctx.extensions
         .get::<axum::http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<Person>())
-        .expect("No verified ClosedMCP person in this request")
 }
 
 #[derive(Clone, Debug)]
@@ -112,8 +113,8 @@ pub struct Verifier {
     resource: String,
     issuer: String,
     allowed: HashSet<String>,
-    jwks_url: String,
-    keys: Arc<RwLock<Option<JwkSet>>>,
+    jwks_url: Option<String>,
+    keys: Arc<Mutex<HashMap<String, (Option<JwkSet>, Option<Instant>)>>>,
     http: reqwest::Client,
 }
 
@@ -142,24 +143,29 @@ impl Verifier {
                 "allowed_domains must name at least one company",
             ));
         }
-        let jwks_url = options
-            .jwks_url
-            .clone()
-            .unwrap_or_else(|| format!("{}/.well-known/jwks.json", options.issuer));
-        Url::parse(&jwks_url).map_err(|_| ConfigError("jwks_url must be a URL"))?;
+        if let Some(ref jwks_url) = options.jwks_url {
+            Url::parse(jwks_url).map_err(|_| ConfigError("jwks_url must be a URL"))?;
+        }
         Ok(Self {
             resource: options.resource.clone(),
             issuer: options.issuer.clone(),
             allowed,
-            jwks_url,
-            keys: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::new(),
+            jwks_url: options.jwks_url.clone(),
+            keys: Arc::new(Mutex::new(HashMap::new())),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|_| ConfigError("invalid HTTP client"))?,
         })
     }
 
-    async fn fetch_keys(&self) -> Result<JwkSet, ()> {
+    async fn fetch_keys(&self, issuer: &str) -> Result<JwkSet, ()> {
+        let url = self
+            .jwks_url
+            .clone()
+            .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json"));
         self.http
-            .get(&self.jwks_url)
+            .get(url)
             .send()
             .await
             .map_err(|_| ())?
@@ -184,16 +190,38 @@ impl Verifier {
             return Err(VerifyError);
         }
         let kid = header.kid.ok_or(())?;
-        let mut keys = self.keys.read().await.clone();
-        if keys.as_ref().and_then(|set| set.find(&kid)).is_none() {
-            let fresh = self.fetch_keys().await?;
-            *self.keys.write().await = Some(fresh.clone());
-            keys = Some(fresh);
+        // The issuer selects a JWKS only after checking the local allowlist.
+        let payload = token.split('.').nth(1).ok_or(())?;
+        let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| ())?;
+        let issuer = serde_json::from_slice::<Claims>(&payload)
+            .map_err(|_| ())?
+            .iss;
+        if issuer != self.issuer && !(self.issuer == CLOSEDMCP && issuer == LEGACY_ISSUER) {
+            return Err(VerifyError);
         }
-        let key = keys.as_ref().and_then(|set| set.find(&kid)).ok_or(())?;
+        let mut cache = self.keys.lock().await;
+        let entry = cache.entry(issuer.clone()).or_insert((None, None));
+        if entry.0.is_none()
+            && entry
+                .1
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+        {
+            entry.1 = Some(Instant::now());
+            entry.0 = Some(self.fetch_keys(&issuer).await?);
+            entry.1 = None;
+        } else if entry.0.as_ref().and_then(|set| set.find(&kid)).is_none()
+            && entry
+                .1
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+        {
+            entry.1 = Some(Instant::now());
+            entry.0 = Some(self.fetch_keys(&issuer).await?);
+        }
+        let key = entry.0.as_ref().and_then(|set| set.find(&kid)).ok_or(())?;
         let decoding = DecodingKey::from_jwk(key).map_err(|_| ())?;
+        drop(cache);
         let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_issuer(&[issuer.as_str()]);
         validation.set_audience(&[self.resource.as_str()]);
         validation.leeway = 0;
         validation.required_spec_claims = ["iss", "aud", "sub", "iat", "exp", "jti"]
@@ -207,7 +235,7 @@ impl Verifier {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ())?
             .as_secs() as i64;
-        if claims.iss != self.issuer
+        if claims.iss != issuer
             || claims.aud != self.resource
             || claims.iat > now
             || claims.exp <= claims.iat
