@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 pub const CLOSEDMCP: &str = "https://closedmcp.com";
-const LEGACY_ISSUER: &str = "https://closedmcp.canpai.io";
+pub const REQUIRED_SCOPE: &str = "mcp:tools";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Person {
@@ -74,7 +74,10 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[derive(Debug)]
-pub struct VerifyError;
+pub enum VerifyError {
+    InvalidToken,
+    InsufficientScope,
+}
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("pass verification failed")
@@ -83,7 +86,7 @@ impl std::fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 impl From<()> for VerifyError {
     fn from(_: ()) -> Self {
-        Self
+        Self::InvalidToken
     }
 }
 
@@ -95,9 +98,17 @@ struct Claims {
     aud: serde_json::Value,
     sub: String,
     email: String,
+    #[serde(rename = "https://closedmcp.com/claims/domain")]
     domain: String,
+    #[serde(rename = "https://closedmcp.com/claims/org")]
     org: String,
-    #[serde(default, deserialize_with = "optional_string_if_present")]
+    client_id: String,
+    scope: String,
+    #[serde(
+        rename = "https://closedmcp.com/claims/client",
+        default,
+        deserialize_with = "optional_string_if_present"
+    )]
     client: Option<String>,
     iat: i64,
     exp: i64,
@@ -185,11 +196,13 @@ impl Verifier {
             || token.is_empty()
             || token.chars().any(char::is_whitespace)
         {
-            return Err(VerifyError);
+            return Err(VerifyError::InvalidToken);
         }
         let header = decode_header(token).map_err(|_| ())?;
-        if header.alg != Algorithm::EdDSA {
-            return Err(VerifyError);
+        if header.alg != Algorithm::EdDSA
+            || !matches!(header.typ.as_deref(), Some("at+jwt" | "application/at+jwt"))
+        {
+            return Err(VerifyError::InvalidToken);
         }
         let kid = header.kid.ok_or(())?;
         // The issuer selects a JWKS only after checking the local allowlist.
@@ -198,8 +211,8 @@ impl Verifier {
         let issuer = serde_json::from_slice::<Claims>(&payload)
             .map_err(|_| ())?
             .iss;
-        if issuer != self.issuer && !(self.issuer == CLOSEDMCP && issuer == LEGACY_ISSUER) {
-            return Err(VerifyError);
+        if issuer != self.issuer {
+            return Err(VerifyError::InvalidToken);
         }
         let mut cache = self.keys.lock().await;
         let entry = cache.entry(issuer.clone()).or_insert((None, None));
@@ -248,9 +261,13 @@ impl Verifier {
             || claims.domain.is_empty()
             || claims.org.is_empty()
             || claims.jti.is_empty()
+            || claims.client_id.is_empty()
             || !self.allowed.contains(&claims.domain.to_ascii_lowercase())
         {
-            return Err(VerifyError);
+            return Err(VerifyError::InvalidToken);
+        }
+        if !claims.scope.split_whitespace().any(|s| s == REQUIRED_SCOPE) {
+            return Err(VerifyError::InsufficientScope);
         }
         Ok(Person {
             id: claims.sub,
@@ -267,6 +284,7 @@ struct Metadata {
     resource: String,
     authorization_servers: Vec<String>,
     bearer_methods_supported: Vec<&'static str>,
+    scopes_supported: Vec<&'static str>,
 }
 
 /// Build an axum router around a fresh rmcp handler for each MCP request.
@@ -287,6 +305,7 @@ where
         resource: options.resource,
         authorization_servers: vec![options.issuer],
         bearer_methods_supported: vec!["header"],
+        scopes_supported: vec![REQUIRED_SCOPE],
     });
     let service = StreamableHttpService::new(
         move || Ok(factory()),
@@ -306,16 +325,19 @@ where
                 .and_then(|v| v.to_str().ok());
             let person = match verifier.verify(authorization).await {
                 Ok(person) => person,
-                Err(VerifyError) => {
-                    let mut response = (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({"error":"unauthorized"})),
-                    )
-                        .into_response();
+                Err(error) => {
+                    let (status, code) = match error {
+                        VerifyError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid_token"),
+                        VerifyError::InsufficientScope => {
+                            (StatusCode::FORBIDDEN, "insufficient_scope")
+                        }
+                    };
+                    let mut response =
+                        (status, Json(serde_json::json!({"error":code}))).into_response();
                     response.headers_mut().insert(
                         header::WWW_AUTHENTICATE,
                         HeaderValue::from_str(&format!(
-                            "Bearer resource_metadata=\"{metadata_url}\""
+                            "Bearer error=\"{code}\", resource_metadata=\"{metadata_url}\", scope=\"{REQUIRED_SCOPE}\""
                         ))
                         .expect("valid metadata URL"),
                     );
