@@ -89,11 +89,17 @@ impl Fixture {
         self.pass_with_kid(changes, key, "test-key")
     }
     fn pass_with_kid(&self, changes: Value, key: Option<&SigningKey>, kid: &str) -> String {
-        let mut claims = json!({"iss":self.issuer,"aud":self.resource,"sub":"person-123","email":EMAIL_ONE,"domain":"example.com","org":"acme","client":"Test app","iat":now(),"exp":now()+300,"jti":"pass-123"});
+        let mut claims = json!({"iss":self.issuer,"aud":self.resource,"sub":"person-123","email":EMAIL_ONE,"domain":"example.com","org":"acme","client":"Test app","iat":now(),"exp":now()+300,"jti":"pass-123","client_id":"test-client","scope":"mcp:tools"});
         for (name, value) in changes.as_object().unwrap() {
             claims[name] = value.clone();
         }
+        for name in ["domain", "org", "client"] {
+            if let Some(value) = claims.as_object_mut().unwrap().remove(name) {
+                claims[format!("https://closedmcp.com/claims/{name}")] = value;
+            }
+        }
         let mut header = Header::new(Algorithm::EdDSA);
+        header.typ = Some(claims["typ"].as_str().unwrap_or("at+jwt").to_owned());
         header.kid = Some(kid.into());
         let der = key.unwrap_or(&self.key).to_pkcs8_der().unwrap();
         encode(&header, &claims, &EncodingKey::from_ed_der(der.as_bytes())).unwrap()
@@ -107,20 +113,20 @@ async fn default_issuers_and_unknown_kid_cooldown() {
     assert_eq!(options.issuer, "https://closedmcp.com");
     options.jwks_url = Some(f.jwks_url.clone());
     let verifier = Verifier::new(&options).unwrap();
-    for issuer in ["https://closedmcp.com", "https://closedmcp.canpai.io"] {
+    for issuer in ["https://closedmcp.com"] {
         let token = f.pass(json!({"iss":issuer}), None);
         assert!(verifier
             .verify(Some(&format!("Bearer {token}")))
             .await
             .is_ok());
     }
-    assert_eq!(f.fetches.load(Ordering::SeqCst), 2);
+    assert_eq!(f.fetches.load(Ordering::SeqCst), 1);
     let other = f.pass(json!({"iss":"https://other.example"}), None);
     assert!(verifier
         .verify(Some(&format!("Bearer {other}")))
         .await
         .is_err());
-    assert_eq!(f.fetches.load(Ordering::SeqCst), 2);
+    assert_eq!(f.fetches.load(Ordering::SeqCst), 1);
     let unknown = f.pass_with_kid(json!({"iss":"https://closedmcp.com"}), None, "unknown");
     for _ in 0..2 {
         assert!(verifier
@@ -128,7 +134,7 @@ async fn default_issuers_and_unknown_kid_cooldown() {
             .await
             .is_err());
     }
-    assert_eq!(f.fetches.load(Ordering::SeqCst), 3);
+    assert_eq!(f.fetches.load(Ordering::SeqCst), 2);
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -156,13 +162,20 @@ async fn verifies_passes_and_required_config() {
         f.pass(json!({"exp":now()-1}), None),
         f.pass(json!({"exp":now()+301}), None),
         f.pass(json!({"domain":"other.example"}), None),
+        f.pass(json!({"iss":"https://closedmcp.canpai.io"}), None),
+        f.pass(json!({"typ":"JWT"}), None),
+        f.pass(json!({"client_id":""}), None),
+        f.pass(json!({"scope":"other"}), None),
         f.pass(json!({}), Some(&wrong_key)),
         f.pass(json!({"client":5}), None),
         f.pass(json!({"client":null}), None),
         f.pass(json!({"jti":""}), None),
         f.pass(json!({"aud":[f.resource]}), None),
     ];
-    assert!(matches!(verify.verify(None).await, Err(VerifyError)));
+    assert!(matches!(
+        verify.verify(None).await,
+        Err(VerifyError::InvalidToken)
+    ));
     for token in bad {
         assert!(verify
             .verify(Some(&format!("Bearer {token}")))
@@ -214,11 +227,22 @@ async fn metadata_mcp_and_concurrent_people() {
         .unwrap();
     assert_eq!(
         metadata,
-        json!({"resource":f.resource,"authorization_servers":[f.issuer],"bearer_methods_supported":["header"]})
+        json!({"resource":f.resource,"authorization_servers":[f.issuer],"bearer_methods_supported":["header"],"scopes_supported":["mcp:tools"]})
     );
     let denied = client.post(format!("{base}/mcp")).send().await.unwrap();
     assert_eq!(denied.status(), 401);
-    assert_eq!(denied.headers()["www-authenticate"], "Bearer resource_metadata=\"http://127.0.0.1:8789/.well-known/oauth-protected-resource/mcp\"");
+    assert_eq!(denied.headers()["www-authenticate"], "Bearer error=\"invalid_token\", resource_metadata=\"http://127.0.0.1:8789/.well-known/oauth-protected-resource/mcp\", scope=\"mcp:tools\"");
+    let denied = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(f.pass(json!({"scope":"other"}), None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert!(denied.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .contains("insufficient_scope"));
     let url = format!("{base}/mcp");
     let alice = f.pass(json!({}), None);
     let bob = f.pass(json!({"sub":"person-456","email":EMAIL_TWO}), None);

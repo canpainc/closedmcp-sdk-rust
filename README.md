@@ -2,6 +2,14 @@
 
 A small Rust wrapper for the official `rmcp` Streamable HTTP server. It checks a ClosedMCP signed pass on every MCP request and serves protected-resource metadata. The crate is its own Cargo workspace and is not part of the server workspace.
 
+The public wrapper in 0.2.0 accepts OAuth resource access tokens with type `at+jwt`, a
+`client_id`, the `mcp:tools` scope and an audience matching the configured MCP URL.
+Company claims use the `https://closedmcp.com/claims/` namespace; the person helper
+keeps its existing fields. Old pass tokens and the implicit legacy issuer are
+rejected. The token follows RFC9068's claims and type using EdDSA; its mandatory
+RS256 support is not implemented. This is MCP OAuth, not ID-JAG/enterprise-managed
+authorization. Hosted caller helpers use their separate private contract.
+
 Install with `cargo add closedmcp-sdk rmcp axum` and `cargo add tokio --features macros,rt-multi-thread,net`. Wrap your existing rmcp handler factory with `router(Options::new(resource, allowed_domains), || MyServer::new())`; tools can read the verified person with `closed_mcp_person(&ctx)`.
 
 ## Hello
@@ -23,7 +31,7 @@ The runnable [template](examples/hello-template.rs) accepts `MCP_URL`, `ALLOWED_
 
 `closed_mcp_person(&ctx)` gives a tool the verified `id`, `email`, `company`, `org`, and optional `ai_app` for that request. `ai_app` is display-only. The router creates a fresh rmcp handler per request and supports concurrent calls. Mount the returned `Router` directly or merge it into an axum application. The router authenticates `/mcp` (or the path in `MCP_URL`) and serves both specific and generic protected-resource metadata paths. A missing or invalid pass gets `401` with `WWW-Authenticate: Bearer resource_metadata="..."`.
 
-The resource must exactly match the public MCP URL and token audience. At least one allowed company domain is required. The issuer defaults to `https://closedmcp.com` and also accepts legacy passes issued by `https://closedmcp.canpai.io`; each issuer uses its own JWKS. Setting `options.issuer` accepts only that issuer. For local tests, set `options.issuer` and `options.jwks_url` before calling `router`. Keys are cached; an unknown key ID triggers at most one refresh per issuer every 30 seconds. JWKS requests time out after 5 seconds.
+The resource must exactly match the public MCP URL and token audience. At least one allowed company domain is required. The issuer defaults to `https://closedmcp.com`. Setting `options.issuer` accepts only that issuer. For local tests, set `options.issuer` and `options.jwks_url` before calling `router`. Keys are cached; an unknown key ID triggers at most one refresh per issuer every 30 seconds. JWKS requests time out after 5 seconds.
 
 Direct calls to `Verifier::verify` return `Result<Person, VerifyError>`; the error indicates a missing or invalid pass or a key fetch failure.
 
